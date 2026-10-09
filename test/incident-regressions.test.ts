@@ -4,8 +4,8 @@ import { openDatabase } from "../src/db.ts";
 import { seedIncident } from "../src/seed.ts";
 
 type Approval = {
-  ledger: { id: string; amount_brl: number; idempotency_key: string };
-  payout: { id: string };
+  ledger: { id: string; mission_id: string; amount_brl: number; idempotency_key: string };
+  payout: { id: string; status: string };
 };
 
 describe("regressões do contrato e dos logs do incidente", () => {
@@ -105,5 +105,64 @@ describe("regressões do contrato e dos logs do incidente", () => {
     };
     expect(mission.ledger).toHaveLength(1);
     expect(mission.payout.status).toBe("paid");
+  });
+
+  it("reutiliza o crédito da missão mesmo com outra chave e preserva o repasse pago", async () => {
+    const payload = { mission_id: "msn_1900", approved_at: "2026-03-12T18:11:00.000Z" };
+    const first = await post("/approvals", { ...payload, idempotency_key: "pay_a" });
+    expect(first.status).toBe(201);
+    const original = await first.json() as Approval;
+    await post(`/payouts/${original.payout.id}/provider`, { provider_status: "RECEIVED" });
+
+    const second = await post("/approvals", { ...payload, idempotency_key: "pay_b" });
+    expect(second.status).toBe(200);
+    const replay = await second.json() as Approval;
+    expect(replay.ledger).toEqual(original.ledger);
+    expect(replay.payout).toMatchObject({ id: original.payout.id, status: "paid" });
+    const mission = await (await app.request("/missions/msn_1900")).json() as { ledger: Approval["ledger"][] };
+    expect(mission.ledger).toEqual([original.ledger]);
+  });
+
+  it.each(["pay_shared", " PAY_SHARED\u200B "])("recusa a chave %j de outra missão sem devolver seu crédito", async (key) => {
+    const approved_at = "2026-03-12T18:11:00.000Z";
+    const first = await post("/approvals", { mission_id: "msn_1900", approved_at, idempotency_key: "pay_shared" });
+    expect(first.status).toBe(201);
+    const original = await first.json() as Approval;
+
+    const collision = await post("/approvals", { mission_id: "msn_2044", approved_at, idempotency_key: key });
+    expect(collision.status).toBe(409);
+    expect(await collision.json()).toEqual({ error: "chave de idempotência já utilizada por outra missão" });
+    const untouched = await (await app.request("/missions/msn_2044")).json();
+    expect(untouched).toMatchObject({ mission: { status: "open" }, ledger: [], payout: null });
+
+    const own = await post("/approvals", { mission_id: "msn_2044", approved_at, idempotency_key: "pay_own" });
+    expect(own.status).toBe(201);
+    expect(await own.json()).toMatchObject({ ledger: { mission_id: "msn_2044", amount_brl: 80 } });
+    const firstMission = await (await app.request("/missions/msn_1900")).json();
+    expect(firstMission).toMatchObject({ ledger: [original.ledger] });
+  });
+
+  it.each(["   ", "\u200B", " \u200B "])("recusa chave vazia após normalizar %j sem criar crédito", async (key) => {
+    const res = await post("/approvals", {
+      mission_id: "msn_1900",
+      approved_at: "2026-03-12T18:11:00.000Z",
+      idempotency_key: key,
+    });
+    expect(res.status).toBe(400);
+    expect(await res.json()).toEqual({ error: "missão, data de aprovação e chave são obrigatórias" });
+    const mission = await (await app.request("/missions/msn_1900")).json();
+    expect(mission).toMatchObject({ mission: { status: "open" }, ledger: [], payout: null });
+  });
+
+  it("mantém um crédito com duas aprovações concorrentes no mesmo processo", async () => {
+    const responses = await Promise.all(["pay_a", "pay_b"].map((key) => post("/approvals", {
+      mission_id: "msn_1900", approved_at: "2026-03-12T18:11:00.000Z", idempotency_key: key,
+    })));
+    expect(responses.map((res) => res.status).sort()).toEqual([200, 201]);
+    const bodies = await Promise.all(responses.map((res) => res.json() as Promise<Approval>));
+    expect(bodies[0].ledger.id).toBe(bodies[1].ledger.id);
+    expect(bodies[0].payout.id).toBe(bodies[1].payout.id);
+    const mission = await (await app.request("/missions/msn_1900")).json();
+    expect(mission).toMatchObject({ ledger: [bodies[0].ledger] });
   });
 });

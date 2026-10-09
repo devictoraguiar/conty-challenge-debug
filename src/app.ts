@@ -59,7 +59,8 @@ export function createApp(db: DatabaseSync) {
     const missionId = typeof record.mission_id === "string" ? record.mission_id : "";
     const approvedAt = typeof record.approved_at === "string" ? record.approved_at : "";
     const rawKey = typeof record.idempotency_key === "string" ? record.idempotency_key : "";
-    if (!missionId || !approvedAt || !rawKey) {
+    const key = normalizeKey(rawKey);
+    if (!missionId || !approvedAt || !key) {
       return c.json({ error: "missão, data de aprovação e chave são obrigatórias" }, 400);
     }
     if (Number.isNaN(new Date(approvedAt).getTime())) {
@@ -98,8 +99,11 @@ export function createApp(db: DatabaseSync) {
       return c.json({ error: "prazo encerrado" }, 409);
     }
 
-    const key = normalizeKey(rawKey);
-    const existing = one<Ledger>(db, "SELECT * FROM ledger WHERE idempotency_key = ?", key);
+    const keyed = one<Ledger>(db, "SELECT * FROM ledger WHERE idempotency_key = ?", key);
+    if (keyed && keyed.mission_id !== mission.id) {
+      return c.json({ error: "chave de idempotência já utilizada por outra missão" }, 409);
+    }
+    const existing = keyed ?? one<Ledger>(db, "SELECT * FROM ledger WHERE mission_id = ?", mission.id);
     if (existing) {
       const payout = one<Payout>(db, "SELECT * FROM payouts WHERE mission_id = ?", mission.id) ?? null;
       return c.json({ mission_id: mission.id, status: mission.status, ledger: existing, payout });
