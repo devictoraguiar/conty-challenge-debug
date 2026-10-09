@@ -1,3 +1,4 @@
 export function normalizeKey(key: string): string {
-  return key.toLowerCase();
+  // U+200B aparece nas bordas da chave reenviada no log e não é removido por trim().
+  return key.replace(/^[\s\u200B]+|[\s\u200B]+$/g, "").toLowerCase();
 }
